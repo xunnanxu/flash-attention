@@ -83,6 +83,7 @@ torch2cute_dtype_map = {
     torch.float16: cutlass.Float16,
     torch.bfloat16: cutlass.BFloat16,
     torch.float32: cutlass.Float32,
+    torch.float8_e4m3fn: "e4m3",
 }
 
 
@@ -129,6 +130,12 @@ def _flash_attn_fwd(
     out: Optional[torch.Tensor] = None,
     lse: Optional[torch.Tensor] = None,
     aux_tensors: Optional[list[torch.Tensor]] = None,
+    q_scale: Optional[torch.Tensor] = None,
+    k_scale: Optional[torch.Tensor] = None,
+    v_scale: Optional[torch.Tensor] = None,
+    # When o_scale is provided the Float32 accumulator is multiplied by 1/o_scale
+    # before casting to o_dtype.  Meaningful only when mO.element_type is FP8.
+    o_scale: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Forward pass for FlashAttention.
 
@@ -165,6 +172,7 @@ def _flash_attn_fwd(
         seqlen_k = k.shape[-3]
     num_head_kv = k.shape[-2]
     head_dim_v = v.shape[-1]
+    
     if cu_seqlens_k is None:
         if page_table is None:
             assert k.shape == (batch_size, seqlen_k, num_head_kv, head_dim)
@@ -189,7 +197,6 @@ def _flash_attn_fwd(
     assert seqused_k is None or seqused_k.shape == (batch_size,), (
         "seqused_k must have shape (batch_size,)"
     )
-    assert q.dtype in [torch.float16, torch.bfloat16], "inputs must be float16 or bfloat16"
     assert q.dtype == k.dtype == v.dtype, "inputs must have the same dtype"
     for t in [cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k]:
         if t is not None:
@@ -202,7 +209,6 @@ def _flash_attn_fwd(
     if learnable_sink is not None:
         assert learnable_sink.shape == (num_head,)
         assert learnable_sink.dtype == torch.bfloat16, "learnable_sink must be bfloat16"
-
     assert all(
         t is None or t.is_cuda
         for t in (
@@ -230,7 +236,7 @@ def _flash_attn_fwd(
     if pack_gqa is None:
         pack_gqa = qhead_per_kvhead > 1
 
-    out_torch_dtype = q.dtype
+    out_torch_dtype = q.dtype if out is None else out.dtype
     device = q.device
     q_batch_seqlen_shape = (batch_size, seqlen_q) if cu_seqlens_q is None else (total_q,)
     lse_shape = (batch_size, num_head, seqlen_q) if cu_seqlens_q is None else (num_head, total_q)
@@ -254,7 +260,6 @@ def _flash_attn_fwd(
 
     dtype = torch2cute_dtype_map[q.dtype]
     arch = _get_device_arch() if _arch is None else _arch
-
     assert arch // 10 in [9, 10, 11], "Unsupported compute capability. Supported: 9.x, 10.x, 11.x"
 
     use_block_sparsity = block_sparse_tensors is not None
@@ -408,6 +413,18 @@ def _flash_attn_fwd(
         page_size not in [None, 128],  # paged KV non-TMA
         q_subtile_factor,
     )
+    
+    # q_scale_dsl = to_cute_tensor(q_scale) #if q_scale is not None else None
+    
+    #q_scale_dsl = q_scale.data_ptr()
+    #k_scale_dsl = to_cute_tensor(k_scale) #if k_scale is not None else None
+    #v_scale_dsl = to_cute_tensor(v_scale) #if v_scale is not None else None
+    #o_scale_dsl = to_cute_tensor(o_scale) #if o_scale is not None else None
+
+    #print([m for m in dir(q_scale_dsl) if not m.startswith('__')])
+    #print(type(q_scale_dsl.iterator))
+    #print([m for m in dir(q_scale_dsl.iterator) if not m.startswith('__')])
+
     if compile_key not in _flash_attn_fwd.compile_cache:
         (
             cu_seqlens_q_tensor,
@@ -512,6 +529,7 @@ def _flash_attn_fwd(
             raise ValueError(
                 f"Unsupported compute capability: {arch}. Supported: 9.x, 10.x, 11.x"
             )
+
         # TODO: check @can_implement
         _flash_attn_fwd.compile_cache[compile_key] = cute.compile(
             fa_fwd,
@@ -532,6 +550,10 @@ def _flash_attn_fwd(
             learnable_sink_tensor,
             sparse_tensors,
             cute_aux_tensors,
+            #q_scale_dsl,
+            #k_scale_dsl,
+            #v_scale_dsl,
+            #o_scale_dsl,
             options="--enable-tvm-ffi",
         )
 
@@ -558,6 +580,10 @@ def _flash_attn_fwd(
             learnable_sink,
             normalized_block_sparse_tensors[:4] if normalized_block_sparse_tensors is not None else None,
             aux_tensors,
+            # q_scale_dsl,
+            #k_scale.detach(),
+            #v_scale.detach(),
+            #o_scale.detach(),
         )
     if is_split_kv:
         _flash_attn_fwd_combine(
@@ -1343,6 +1369,13 @@ class FlashAttnFunc(torch.autograd.Function):
         mask_block_idx: Optional[torch.Tensor] = None,
         block_size: Optional[Tuple[int, int]] = None,
         return_lse: bool = False,
+        q_scale: Optional[torch.Tensor] = None,
+        k_scale: Optional[torch.Tensor] = None,
+        v_scale: Optional[torch.Tensor] = None,
+        # When o_scale is provided the Float32 accumulator is multiplied by 1/o_scale
+        # before casting to o_dtype.  Meaningful only when mO.element_type is FP8.
+        o_scale: Optional[torch.Tensor] = None,
+        out: Optional[torch.Tensor] = None,
     ):
         # Only create block sparse tensors if at least one block sparse parameter is provided
         block_sparse_tensors = None
@@ -1369,6 +1402,11 @@ class FlashAttnFunc(torch.autograd.Function):
             mask_mod=mask_mod,
             block_sparse_tensors=block_sparse_tensors,
             return_lse=return_lse,
+            q_scale=q_scale,
+            k_scale=k_scale,
+            v_scale=v_scale,
+            o_scale=o_scale,
+            out=out,
         )
         ctx.save_for_backward(q, k, v, out, lse)
         ctx.softmax_scale = softmax_scale
@@ -1426,6 +1464,13 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
         score_mod: Optional[Callable] = None,
         aux_tensors: Optional[list] = None,
         return_lse: bool = False,
+        q_scale: Optional[torch.Tensor] = None,
+        k_scale: Optional[torch.Tensor] = None,
+        v_scale: Optional[torch.Tensor] = None,
+        # When o_scale is provided the Float32 accumulator is multiplied by 1/o_scale
+        # before casting to o_dtype.  Meaningful only when mO.element_type is FP8.
+        o_scale: Optional[torch.Tensor] = None,
+        out: Optional[torch.Tensor] = None,
     ):
         out, lse = _flash_attn_fwd(
             q,
@@ -1449,6 +1494,11 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
             score_mod=score_mod,
             aux_tensors=aux_tensors,
             return_lse=return_lse,
+            q_scale=q_scale,
+            k_scale=k_scale,
+            v_scale=v_scale,
+            o_scale=o_scale,
+            out=out,
         )
         ctx.save_for_backward(q, k, v, out, lse, cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k)
         ctx.softmax_scale = softmax_scale
@@ -1555,6 +1605,13 @@ def flash_attn_varlen_func(
     score_mod: Optional[Callable] = None,
     aux_tensors: Optional[list] = None,
     return_lse: bool = False,
+    q_scale: Optional[torch.Tensor] = None,
+    k_scale: Optional[torch.Tensor] = None,
+    v_scale: Optional[torch.Tensor] = None,
+    # When o_scale is provided the Float32 accumulator is multiplied by 1/o_scale
+    # before casting to o_dtype.  Meaningful only when mO.element_type is FP8.
+    o_scale: Optional[torch.Tensor] = None,
+    out: Optional[torch.Tensor] = None,
 ):
     return FlashAttnVarlenFunc.apply(
         q,
@@ -1578,6 +1635,11 @@ def flash_attn_varlen_func(
         score_mod,
         aux_tensors,
         return_lse,
+        q_scale,
+        k_scale,
+        v_scale,
+        o_scale,
+        out,
     )
 
 

@@ -7,6 +7,7 @@ from enum import IntEnum
 
 import cutlass
 import cutlass.cute as cute
+from cutlass.base_dsl.typing import Float8E4M3FN
 
 # ---------------------------------------------------------------------------
 # Enumerations that match the HW encodings (values MUST stay identical)
@@ -83,7 +84,7 @@ def to_UMMA_format(cutlass_type) -> int:
     if cutlass_type is cutlass.TFloat32:
         return F16F32Format.TF32
     # Float-8 / Float-6 / Float-4 – add whenever CUTLASS exposes them
-    if cutlass_type is cutlass.FloatE4M3FN:
+    if cutlass_type is Float8E4M3FN:
         return MXF8F6F4Format.E4M3
     if cutlass_type is cutlass.FloatE5M2:
         return MXF8F6F4Format.E5M2

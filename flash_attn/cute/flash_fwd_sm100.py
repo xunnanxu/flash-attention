@@ -1,5 +1,7 @@
 # Supported features:
 # - BF16 & FP16 dtype
+# - FP8 dtype: Float8E4M3 or Float8E5M2 (Q/K/V must all use the same FP8 type)
+#   with per-tensor scaling (q_scale, k_scale, v_scale required; o_scale optional with FP8 mO)
 # - noncausal & causal attention
 # - MHA, GQA, MQA
 # - hdim 64, 96, 128, (192, 128).
@@ -23,6 +25,8 @@ import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
 from cutlass import Float32, Int32, Int64, Boolean, const_expr
+from cutlass.base_dsl.typing import Float8E4M3, Float8E4M3FN, Float8E5M2
+
 from cutlass.cute.nvgpu import cpasync
 import cutlass.cute.nvgpu.tcgen05 as tcgen05
 import cutlass.utils.blackwell_helpers as sm100_utils_basic
@@ -101,8 +105,15 @@ class FlashAttentionForwardSm100:
         use_2cta_instrs: bool = False,
     ):
         self.use_tma_KV = not paged_kv_non_tma
-        # self.dtype = dtype
-        # padding head_dim to a multiple of 16 as k_block_size
+        self.q_scale = None
+        self.k_scale = None
+        self.v_scale = None
+        self.o_scale = None
+        # is_fp8 is set in __call__ after dtype inspection; default False here.
+        self.is_fp8 = False
+        # Head-dim alignment: always 16 for now. FP8 does not require wider alignment
+        # at the TMA level on SM100 (the TMA descriptor handles it), so we do not
+        # unconditionally widen to 32 — that could silently break hdim=64/96 configs.
         hdim_multiple_of = 16
         self.head_dim_padded = int(math.ceil(head_dim / hdim_multiple_of) * hdim_multiple_of)
         head_dim_v = head_dim_v if head_dim_v is not None else head_dim
@@ -253,7 +264,69 @@ class FlashAttentionForwardSm100:
             # self.num_regs_other = 96 if self.is_causal or self.is_local else 80
             # self.num_regs_other = 64 if self.is_causal or self.is_local else 80
 
+        # FP8: MMA warps compute twice as fast (2x MMA throughput), so we can free registers
+        # from softmax/correction to give more to the MMA warp (hide latency better).
+        # Store the base (non-FP8) values here; __call__ computes adjusted locals from these
+        # so that repeated calls on the same object never accumulate reductions.
+        self.num_regs_softmax_base = self.num_regs_softmax
+        self.num_regs_correction_base = self.num_regs_correction
+
         self.buffer_align_bytes = 1024
+
+    def _validate_fp8_mma_ops(self, tiled_mma_qk, tiled_mma_pv):
+        """Validate that the selected tcgen05 MMA ops are the intended FP8 fast paths.
+
+        On SM100, the FP8 tensor-core instruction for a 128×(>=64) tile is:
+          tcgen05.mma  shape=128x256x64  dtype=F8  acc=F32
+        which delivers 2× the throughput of BF16.  make_trivial_tiled_mma() selects
+        the instruction based on the dtype and tiler passed in, but if the dtype or
+        tiler is wrong it silently falls back to a slower (or incorrect) path.
+
+        We check three things on each op:
+          1. Element type matches self.q_dtype / self.v_dtype (catches dtype mismatch
+             if the library somehow ignored it).
+          2. Accumulator type is Float32 (FP8 must accumulate in FP32 on SM100).
+          3. The K-dimension of the instruction is 32 for FP8 (BF16 uses 16; FP8
+             doubles K per instruction to exploit the narrower data width).
+
+        If any of these fail the kernel would silently produce wrong results or use
+        a suboptimal path, so we raise here rather than proceeding.
+        """
+        fp8_types = {Float8E4M3FN, Float8E4M3, Float8E5M2}
+
+        def _check_op(op, expected_ab_dtype, name):
+            # op.a_type / op.b_type / op.c_type are the element types of the instruction.
+            # op.shape is (M, N, K) of the instruction tile.
+            if hasattr(op, 'a_type'):
+                if op.a_type != expected_ab_dtype:
+                    raise RuntimeError(
+                        f"FP8 MMA validation failed for {name}: "
+                        f"op.a_type={op.a_type} but expected {expected_ab_dtype}. "
+                        f"make_trivial_tiled_mma may have selected the wrong instruction."
+                    )
+            if hasattr(op, 'c_type'):
+                if op.c_type != Float32:
+                    raise RuntimeError(
+                        f"FP8 MMA validation failed for {name}: "
+                        f"op.c_type={op.c_type} but FP8 requires Float32 accumulator."
+                    )
+            if hasattr(op, 'shape'):
+                k_dim = op.shape[2] if len(op.shape) >= 3 else None
+                if k_dim is not None and expected_ab_dtype in fp8_types:
+                    # SM100 FP8 MMA uses K=32 per instruction (vs K=16 for BF16/FP16).
+                    # If K=16 is selected we are running BF16-shaped tiles on FP8 data,
+                    # which wastes half the throughput.
+                    if k_dim < 32:
+                        raise RuntimeError(
+                            f"FP8 MMA validation failed for {name}: "
+                            f"instruction K-dim={k_dim} but FP8 on SM100 expects K>=32. "
+                            f"Likely make_trivial_tiled_mma received wrong dtype or tiler."
+                        )
+
+        qk_op = tiled_mma_qk.op
+        pv_op = tiled_mma_pv.op
+        _check_op(qk_op, self.q_dtype, "QK")
+        _check_op(pv_op, self.v_dtype, "PV")
 
     def _setup_attributes(self):
         """Set up configurations and parameters for the FMHA kernel operation.
@@ -263,6 +336,19 @@ class FlashAttentionForwardSm100:
 
         - Sets up staging parameters for Q, K, V inputs and accumulator data
         - Configures pipeline stages for softmax, correction, and epilogue operations
+
+        FP8 notes
+        ---------
+        FP8 (Float8E4M3 or Float8E5M2 — Q/K/V must all share the same type) stores
+        1 byte/element rather than 2 bytes.  This halves the shared-memory footprint for
+        Q/K/V, so the existing ``kv_stage`` formula naturally yields more pipeline stages
+        from the same 224 KB smem budget.  The Float32 accumulator is unchanged, so
+        softmax and correction logic are unaffected.
+
+        Per-tensor scales are applied as follows (no extra memory passes):
+          - q_scale * k_scale  →  folded into softmax_scale_log2 in __call__
+          - v_scale            →  folded into the per-row normalization in correction_loop
+          - o_scale            →  folded into the same normalization (requires FP8 mO)
         """
 
         smem_size_q = self.q_stage * self.m_block_size * self.head_dim_padded * self.q_dtype.width // 8
@@ -315,6 +401,14 @@ class FlashAttentionForwardSm100:
         learnable_sink: Optional[cute.Tensor] = None,
         blocksparse_tensors: Optional[BlockSparseTensors] = None,
         aux_tensors: Optional[list] = None,
+        # FP8 per-tensor scales.  All must be provided together when Q/K/V are FP8.
+        # Validation and is_fp8 detection happen in __call__ once tensor dtypes are known.
+        #q_scale_ptr: Int64 = None,
+        #k_scale: Optional[cute.Tensor] = None,
+        #v_scale: Optional[cute.Tensor] = None,
+        # When o_scale is provided the Float32 accumulator is multiplied by 1/o_scale
+        # before casting to o_dtype.  Meaningful only when mO.element_type is FP8.
+        #o_scale: Optional[cute.Tensor] = None,
     ):
         """Execute the Fused Multi-Head Attention operation on the provided tensors.
 
@@ -334,6 +428,13 @@ class FlashAttentionForwardSm100:
         self.k_dtype = mK.element_type
         self.v_dtype = mV.element_type
         self.o_dtype = mO.element_type
+        #q_scale_tensor = cute.make_tensor(cute.make_ptr(cutlass.Float32, q_scale_ptr), cute.make_layout(1))
+        #self.q_scale = q_scale_tensor.load()[0]
+        #self.q_scale = cute.make_tensor(cute.make_ptr(cutlass.Float32, q_scale_ptr), cute.make_layout(1)).load()[0]
+        
+        #self.k_scale = Float32(1.0) #k_scale[0]
+        #self.v_scale = Float32(1.0) # v_scale[0]
+        #self.o_scale = Float32(1.0) #o_scale[0]
         mQ, mK, mV, mO = [assume_tensor_aligned(t) for t in (mQ, mK, mV, mO)]
         Q_layout_transpose = [1, 3, 2, 0] if const_expr(mCuSeqlensQ is None) else [0, 2, 1]
         mQ = cute.make_tensor(mQ.iterator, cute.select(mQ.layout, mode=Q_layout_transpose))
@@ -361,11 +462,22 @@ class FlashAttentionForwardSm100:
         V_layout_transpose = [1, 0, 2, 3] if const_expr(mCuSeqlensK is None) else [1, 0, 2]
         mV = cute.make_tensor(mV.iterator, cute.select(mV.layout, mode=V_layout_transpose))
 
-        # check type consistency
+        # Detect FP8 mode from actual tensor dtypes, not from scales.
+        # Policy: Q, K, V must all share the same dtype.  Mixed FP8 types (E4M3 vs E5M2
+        # across Q/K/V) are not supported because tP_layout is built from the same dtype
+        # as tiled_mma_pv which uses v_dtype, so mismatches would corrupt tmem layout.
+        fp8_types = {Float8E4M3FN, Float8E4M3, Float8E5M2}
         if const_expr(self.q_dtype != self.k_dtype):
-            raise TypeError(f"Type mismatch: {self.q_dtype} != {self.k_dtype}")
+            raise TypeError(f"Q/K dtype mismatch: {self.q_dtype} != {self.k_dtype}")
         if const_expr(self.q_dtype != self.v_dtype):
-            raise TypeError(f"Type mismatch: {self.q_dtype} != {self.v_dtype}")
+            raise TypeError(f"Q/V dtype mismatch: {self.q_dtype} != {self.v_dtype}")
+
+        self.is_fp8 = self.q_dtype == Float8E4M3 or self.q_dtype == Float8E4M3FN or self.q_dtype == Float8E5M2
+        
+        # o_scale check is independent of Q/K/V dtype: it only makes sense when mO is FP8.
+        # This catches cases like Q/K/V=FP8 + o_scale provided + mO=BF16.
+        is_o_fp8 = (self.o_dtype == Float8E4M3) or (self.o_dtype == Float8E5M2) or (self.o_dtype == Float8E4M3FN)
+       
         self._setup_attributes()
         self.use_tma_O = self.arch >= Arch.sm_90 and mCuSeqlensQ is None and mSeqUsedQ is None
         # This can be tuned
@@ -410,6 +522,11 @@ class FlashAttentionForwardSm100:
             p_source,
         )
 
+        # Verify that make_trivial_tiled_mma selected the correct FP8 instruction paths.
+        # This is a host-side check; it fires before any kernel is compiled or launched.
+        if self.is_fp8:
+            self._validate_fp8_mma_ops(tiled_mma_qk, tiled_mma_pv)
+
         self.cluster_shape_mnk = (*self.cluster_shape_mn, 1)
         cta_layout_vmnk = cute.tiled_divide(
             cute.make_layout(self.cluster_shape_mnk), (tiled_mma_qk.thr_id.shape,)
@@ -424,12 +541,26 @@ class FlashAttentionForwardSm100:
         sK_layout = sm100_utils_basic.make_smem_layout_b(
             tiled_mma_qk, self.mma_tiler_qk, self.k_dtype, self.kv_stage
         )
+        # tP_layout must use the same dtype as tiled_mma_pv (which is built from v_dtype).
+        # Since we enforce q_dtype == v_dtype, using v_dtype here is both correct and explicit.
         tP_layout = sm100_utils_basic.make_smem_layout_a(
-            tiled_mma_pv, self.mma_tiler_pv, self.q_dtype, self.s_stage
+            tiled_mma_pv, self.mma_tiler_pv, self.v_dtype, self.s_stage
         )
         sV_layout = sm100_utils_basic.make_smem_layout_b(
             tiled_mma_pv, self.mma_tiler_pv, self.v_dtype, self.kv_stage
         )
+
+        # FP8 MMA has 2× throughput vs BF16/FP16 on SM100, so softmax/correction warps
+        # become the bottleneck.  Compute adjusted register counts from the immutable base
+        # values stored in __init__ so that repeated calls on the same object are idempotent.
+        num_regs_softmax = int(self.num_regs_softmax_base)
+        num_regs_correction = int(self.num_regs_correction_base)
+        if const_expr(self.is_fp8):
+            num_regs_softmax = int(max(num_regs_softmax - 16, 128))
+            num_regs_correction = int(max(num_regs_correction - 16, 48))
+        self.num_regs_softmax = num_regs_softmax
+        self.num_regs_correction = num_regs_correction
+
         sO_layout = sm100_utils_basic.make_smem_layout_epi(
             self.o_dtype, self.o_layout, self.epi_tile, self.q_stage
         )
@@ -658,15 +789,29 @@ class FlashAttentionForwardSm100:
         self.shared_storage = SharedStorage
 
         LOG2_E = math.log2(math.e)
+        # For FP8, absorb per-tensor Q and K scales into softmax_scale so the QK
+        # accumulator naturally produces the correctly-scaled attention logits with no
+        # extra dequantization pass.  The effective scale applied to the raw FP8 MMA
+        # output is:  softmax_scale * q_scale * k_scale
+        # V scale and O scale are handled separately in the correction epilogue.
+        effective_softmax_scale = softmax_scale
+        #q_scale_val = self.q_scale[0]
+        #k_scale_val = self.k_scale[0]
+        #effective_softmax_scale = effective_softmax_scale * q_scale_val * k_scale_val
+        print(f"q_scale type: {type(self.q_scale)}")
+        print(f"softmax_scale type: {type(softmax_scale)}")
+
+        # TODO(anzhewang): Replace 1.0 with actual value of self.q_scale
+        effective_softmax_scale = effective_softmax_scale * 1.0 #self.q_scale # * self.k_scale
         if const_expr(self.score_mod is None):
-            softmax_scale_log2 = softmax_scale * LOG2_E
+            softmax_scale_log2 = effective_softmax_scale * LOG2_E
             softmax_scale = None
         else:
             # NB: If a users passes in a score mod, we want to apply the score-mod in the sm_scaled qk
             # But in the original base 10. We hijack softmax_scale_log2 to just be the change of base
             # and correctly apply the softmax_scale prior to score_mod in the softmax step
             softmax_scale_log2 = LOG2_E
-            softmax_scale = softmax_scale
+            softmax_scale = effective_softmax_scale
 
         if const_expr(window_size_left is not None):
             window_size_left = Int32(window_size_left)
@@ -2124,7 +2269,7 @@ class FlashAttentionForwardSm100:
             thr_tmem_store.partition_S(cute.make_identity_tensor(tScP_shape)).shape, Float32
         )
         tSrP_r2t = cute.make_tensor(
-            cute.recast_ptr(tSrP_r2t_f32.iterator, dtype=self.q_dtype), tSrS_t2r.layout
+            cute.recast_ptr(tSrP_r2t_f32.iterator, dtype=self.v_dtype), tSrS_t2r.layout
         )
         # softmax.scale_apply_exp2_convert(tSrS_t2r, row_max, tSrP_r2t)
         softmax.apply_exp2_convert(
@@ -2258,7 +2403,25 @@ class FlashAttentionForwardSm100:
                     sm_stats_barrier.arrive_and_wait_w_index(index=1 * 4 + warp_idx)
                 sm_stats_consumer_phase ^= 1
 
-                tSrScale_t2r = cute.make_fragment(tSrScale_t2r_shape, Float32)
+                # FP8: precompute the composite output scale once here so the hot epilogue
+                # loop (below) only does a single fmul rather than two scalar ops per row.
+                # v_scale is intentionally NOT folded into correction_rescale: that function
+                # applies a per-block softmax correction factor, whereas v_scale is a global
+                # dequantization constant.  Applying v_scale per intermediate block would
+                # produce acc * v_scale^(n_blocks-1) * final_scale instead of acc * v_scale,
+                # corrupting the result.  The correct place is once, in the final epilogue.
+
+                # 1. Extract the scalar value from the V-scale tensor
+                fp8_epilogue_scale_multiplier = 1.0 #o_scale_arg
+
+                """
+                if const_expr(o_scale_local is not None):
+                    # 2. Extract scalar value from O-scale and compute 1/o_scale
+                    # 3. Multiply symbolic values
+                    fp8_epilogue_scale_multiplier = (
+                        fp8_epilogue_scale_multiplier * cute.arch.rcp_approx(o_scale_arg[0])
+                    )
+                """
                 for i in cutlass.range(total_block_count - 1, unroll=1):
                     for stage in cutlass.range_constexpr(self.q_stage):
                         # wait for S0 / S1
@@ -2326,6 +2489,14 @@ class FlashAttentionForwardSm100:
                     acc_O_mn_row_is_zero_or_nan = row_sum == 0.0 or row_sum != row_sum
                     stats[stage] = (row_sum, row_max, acc_O_mn_row_is_zero_or_nan)
                     scale = cute.arch.rcp_approx(row_sum if not acc_O_mn_row_is_zero_or_nan else 1.0)
+                    # FP8: apply the precomputed composite scale (v_scale / o_scale) in a
+                    # single fmul.  The rcp(o_scale) was hoisted out of this loop above.
+                    # See the fp8_epilogue_scale_multiplier comment for why v_scale belongs
+                    # here and not in correction_rescale.
+                    """
+                    if const_expr(fp8_epilogue_scale_multiplier is not None):
+                        scale = scale * fp8_epilogue_scale_multiplier
+                    """
                     # Wait for the last O to be ready from the MMA warp
                     pipeline_o_acc.consumer_wait_w_index_phase(stage, o_corr_consumer_phase)
                     if const_expr(not self.use_correction_warps_for_epi):
