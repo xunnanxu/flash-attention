@@ -105,10 +105,6 @@ class FlashAttentionForwardSm100:
         use_2cta_instrs: bool = False,
     ):
         self.use_tma_KV = not paged_kv_non_tma
-        self.q_scale = None
-        self.k_scale = None
-        self.v_scale = None
-        self.o_scale = None
         # is_fp8 is set in __call__ after dtype inspection; default False here.
         self.is_fp8 = False
         # Head-dim alignment: always 16 for now. FP8 does not require wider alignment
@@ -401,14 +397,12 @@ class FlashAttentionForwardSm100:
         learnable_sink: Optional[cute.Tensor] = None,
         blocksparse_tensors: Optional[BlockSparseTensors] = None,
         aux_tensors: Optional[list] = None,
-        # FP8 per-tensor scales.  All must be provided together when Q/K/V are FP8.
-        # Validation and is_fp8 detection happen in __call__ once tensor dtypes are known.
-        #q_scale_ptr: Int64 = None,
-        #k_scale: Optional[cute.Tensor] = None,
-        #v_scale: Optional[cute.Tensor] = None,
-        # When o_scale is provided the Float32 accumulator is multiplied by 1/o_scale
-        # before casting to o_dtype.  Meaningful only when mO.element_type is FP8.
-        #o_scale: Optional[cute.Tensor] = None,
+        # FP8 per-tensor scales passed as GPU data pointers (Int64).
+        # Values are loaded on-device via cute.make_ptr (no host sync).
+        q_scale_ptr: Optional[Int64] = None,
+        k_scale_ptr: Optional[Int64] = None,
+        v_scale_ptr: Optional[Int64] = None,
+        o_scale_ptr: Optional[Int64] = None,
     ):
         """Execute the Fused Multi-Head Attention operation on the provided tensors.
 
@@ -428,13 +422,6 @@ class FlashAttentionForwardSm100:
         self.k_dtype = mK.element_type
         self.v_dtype = mV.element_type
         self.o_dtype = mO.element_type
-        #q_scale_tensor = cute.make_tensor(cute.make_ptr(cutlass.Float32, q_scale_ptr), cute.make_layout(1))
-        #self.q_scale = q_scale_tensor.load()[0]
-        #self.q_scale = cute.make_tensor(cute.make_ptr(cutlass.Float32, q_scale_ptr), cute.make_layout(1)).load()[0]
-        
-        #self.k_scale = Float32(1.0) #k_scale[0]
-        #self.v_scale = Float32(1.0) # v_scale[0]
-        #self.o_scale = Float32(1.0) #o_scale[0]
         mQ, mK, mV, mO = [assume_tensor_aligned(t) for t in (mQ, mK, mV, mO)]
         Q_layout_transpose = [1, 3, 2, 0] if const_expr(mCuSeqlensQ is None) else [0, 2, 1]
         mQ = cute.make_tensor(mQ.iterator, cute.select(mQ.layout, mode=Q_layout_transpose))
@@ -789,29 +776,12 @@ class FlashAttentionForwardSm100:
         self.shared_storage = SharedStorage
 
         LOG2_E = math.log2(math.e)
-        # For FP8, absorb per-tensor Q and K scales into softmax_scale so the QK
-        # accumulator naturally produces the correctly-scaled attention logits with no
-        # extra dequantization pass.  The effective scale applied to the raw FP8 MMA
-        # output is:  softmax_scale * q_scale * k_scale
-        # V scale and O scale are handled separately in the correction epilogue.
-        effective_softmax_scale = softmax_scale
-        #q_scale_val = self.q_scale[0]
-        #k_scale_val = self.k_scale[0]
-        #effective_softmax_scale = effective_softmax_scale * q_scale_val * k_scale_val
-        print(f"q_scale type: {type(self.q_scale)}")
-        print(f"softmax_scale type: {type(softmax_scale)}")
-
-        # TODO(anzhewang): Replace 1.0 with actual value of self.q_scale
-        effective_softmax_scale = effective_softmax_scale * 1.0 #self.q_scale # * self.k_scale
         if const_expr(self.score_mod is None):
-            softmax_scale_log2 = effective_softmax_scale * LOG2_E
+            softmax_scale_log2 = softmax_scale * LOG2_E
             softmax_scale = None
         else:
-            # NB: If a users passes in a score mod, we want to apply the score-mod in the sm_scaled qk
-            # But in the original base 10. We hijack softmax_scale_log2 to just be the change of base
-            # and correctly apply the softmax_scale prior to score_mod in the softmax step
             softmax_scale_log2 = LOG2_E
-            softmax_scale = effective_softmax_scale
+            softmax_scale = softmax_scale
 
         if const_expr(window_size_left is not None):
             window_size_left = Int32(window_size_left)
@@ -858,6 +828,10 @@ class FlashAttentionForwardSm100:
             tma_atom_O,
             softmax_scale_log2,
             softmax_scale,
+            q_scale_ptr,
+            k_scale_ptr,
+            v_scale_ptr,
+            o_scale_ptr,
             window_size_left,
             window_size_right,
             learnable_sink,
@@ -903,6 +877,10 @@ class FlashAttentionForwardSm100:
         tma_atom_O: Optional[cute.CopyAtom],
         softmax_scale_log2: Float32,
         softmax_scale: Float32 | None,
+        q_scale_ptr: Optional[Int64],
+        k_scale_ptr: Optional[Int64],
+        v_scale_ptr: Optional[Int64],
+        o_scale_ptr: Optional[Int64],
         window_size_left: Optional[Int32],
         window_size_right: Optional[Int32],
         learnable_sink: Optional[cute.Tensor],
@@ -934,6 +912,18 @@ class FlashAttentionForwardSm100:
         using tensor memory access (TMA) for efficient data loading, warp specialization for different
         computation phases, and optional attention masking.
         """
+
+        # FP8 per-tensor scales: load scalar values from GPU pointers on-device.
+        def _load_scale_ptr(ptr):
+            return Float32(cute.make_tensor(cute.make_ptr(cutlass.Float32, ptr), cute.make_layout(1))[0])
+        q_scale_val = _load_scale_ptr(q_scale_ptr) if const_expr(q_scale_ptr is not None) else Float32(1.0)
+        k_scale_val = _load_scale_ptr(k_scale_ptr) if const_expr(k_scale_ptr is not None) else Float32(1.0)
+        v_scale_val = _load_scale_ptr(v_scale_ptr) if const_expr(v_scale_ptr is not None) else Float32(1.0)
+        o_scale_val = _load_scale_ptr(o_scale_ptr) if const_expr(o_scale_ptr is not None) else None
+        # Fold q_scale * k_scale into softmax_scale_log2 (and softmax_scale if score_mod)
+        softmax_scale_log2 = softmax_scale_log2 * q_scale_val * k_scale_val
+        if const_expr(softmax_scale is not None):
+            softmax_scale = softmax_scale * q_scale_val * k_scale_val
 
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
 
@@ -1328,6 +1318,8 @@ class FlashAttentionForwardSm100:
                 gmem_tiled_copy_O,
                 tma_atom_O,
                 softmax_scale_log2,
+                v_scale_val,
+                o_scale_val,
                 block_info,
                 num_splits,
                 SeqlenInfoCls,
@@ -2324,6 +2316,8 @@ class FlashAttentionForwardSm100:
         gmem_tiled_copy_O: cute.TiledCopy,
         tma_atom_O: cute.CopyAtom,
         softmax_scale_log2: Float32,
+        v_scale_val: Float32,
+        o_scale_val: Optional[Float32],
         block_info: BlockInfo,
         num_splits: Int32,
         SeqlenInfoCls: Callable,
@@ -2411,17 +2405,12 @@ class FlashAttentionForwardSm100:
                 # produce acc * v_scale^(n_blocks-1) * final_scale instead of acc * v_scale,
                 # corrupting the result.  The correct place is once, in the final epilogue.
 
-                # 1. Extract the scalar value from the V-scale tensor
-                fp8_epilogue_scale_multiplier = 1.0 #o_scale_arg
-
-                """
-                if const_expr(o_scale_local is not None):
-                    # 2. Extract scalar value from O-scale and compute 1/o_scale
-                    # 3. Multiply symbolic values
+                # Composite epilogue scale: v_scale / o_scale
+                fp8_epilogue_scale_multiplier = v_scale_val
+                if const_expr(o_scale_val is not None):
                     fp8_epilogue_scale_multiplier = (
-                        fp8_epilogue_scale_multiplier * cute.arch.rcp_approx(o_scale_arg[0])
+                        fp8_epilogue_scale_multiplier * cute.arch.rcp_approx(o_scale_val)
                     )
-                """
                 for i in cutlass.range(total_block_count - 1, unroll=1):
                     for stage in cutlass.range_constexpr(self.q_stage):
                         # wait for S0 / S1
@@ -2493,10 +2482,7 @@ class FlashAttentionForwardSm100:
                     # single fmul.  The rcp(o_scale) was hoisted out of this loop above.
                     # See the fp8_epilogue_scale_multiplier comment for why v_scale belongs
                     # here and not in correction_rescale.
-                    """
-                    if const_expr(fp8_epilogue_scale_multiplier is not None):
-                        scale = scale * fp8_epilogue_scale_multiplier
-                    """
+                    scale = scale * fp8_epilogue_scale_multiplier
                     # Wait for the last O to be ready from the MMA warp
                     pipeline_o_acc.consumer_wait_w_index_phase(stage, o_corr_consumer_phase)
                     if const_expr(not self.use_correction_warps_for_epi):

@@ -19,21 +19,19 @@
 # - FP8
 # - bwd pass optimized for Hopper/Blackwell
 
-import os
 import math
+import os
 from functools import lru_cache
-from typing import Optional, Tuple, Callable
-
-import torch
-
+from typing import Callable, Optional, Tuple
 
 import cuda.bindings.driver as cuda
-
 import cutlass
 import cutlass.cute as cute
+import torch
+from cutlass import Int64
+
 from flash_attn.cute.cache_utils import get_jit_cache
 from flash_attn.cute.testing import is_fake_mode
-
 
 if os.environ.get("CUTE_DSL_PTXAS_PATH", None) is not None:
     from flash_attn.cute import cute_dsl_ptxas  # noqa: F401
@@ -43,24 +41,27 @@ if os.environ.get("CUTE_DSL_PTXAS_PATH", None) is not None:
 
 
 from flash_attn.cute import utils
-from flash_attn.cute.cute_dsl_utils import (
-    to_cute_tensor, to_cute_aux_tensor, get_aux_tensor_metadata, get_broadcast_dims,
-)
-from flash_attn.cute.flash_fwd import FlashAttentionForwardSm90
-from flash_attn.cute.flash_fwd_sm100 import FlashAttentionForwardSm100
-from flash_attn.cute.flash_bwd_preprocess import FlashAttentionBackwardPreprocess
-from flash_attn.cute.flash_bwd import FlashAttentionBackwardSm80
-from flash_attn.cute.flash_bwd_sm90 import FlashAttentionBackwardSm90
-from flash_attn.cute.flash_bwd_sm100 import FlashAttentionBackwardSm100
-from flash_attn.cute.flash_bwd_postprocess import FlashAttentionBackwardPostprocess
-from flash_attn.cute.flash_fwd_combine import FlashAttentionForwardCombine
-
 from flash_attn.cute.block_sparsity import (
     BlockSparseTensorsTorch,
-    to_cute_block_sparse_tensors,
     normalize_block_sparse_config,
     normalize_block_sparse_config_bwd,
+    to_cute_block_sparse_tensors,
 )
+from flash_attn.cute.cute_dsl_utils import (
+    get_aux_tensor_metadata,
+    get_broadcast_dims,
+    to_cute_aux_tensor,
+    to_cute_tensor,
+)
+from flash_attn.cute.flash_bwd import FlashAttentionBackwardSm80
+from flash_attn.cute.flash_bwd_postprocess import FlashAttentionBackwardPostprocess
+from flash_attn.cute.flash_bwd_preprocess import FlashAttentionBackwardPreprocess
+from flash_attn.cute.flash_bwd_sm90 import FlashAttentionBackwardSm90
+from flash_attn.cute.flash_bwd_sm100 import FlashAttentionBackwardSm100
+from flash_attn.cute.flash_fwd import FlashAttentionForwardSm90
+from flash_attn.cute.flash_fwd_combine import FlashAttentionForwardCombine
+from flash_attn.cute.flash_fwd_sm100 import FlashAttentionForwardSm100
+
 
 @lru_cache(maxsize=None)
 def _get_device_arch():
@@ -412,18 +413,17 @@ def _flash_attn_fwd(
         arch,
         page_size not in [None, 128],  # paged KV non-TMA
         q_subtile_factor,
+        q_scale is not None,
+        k_scale is not None,
+        v_scale is not None,
+        o_scale is not None,
     )
     
-    # q_scale_dsl = to_cute_tensor(q_scale) #if q_scale is not None else None
-    
-    #q_scale_dsl = q_scale.data_ptr()
-    #k_scale_dsl = to_cute_tensor(k_scale) #if k_scale is not None else None
-    #v_scale_dsl = to_cute_tensor(v_scale) #if v_scale is not None else None
-    #o_scale_dsl = to_cute_tensor(o_scale) #if o_scale is not None else None
-
-    #print([m for m in dir(q_scale_dsl) if not m.startswith('__')])
-    #print(type(q_scale_dsl.iterator))
-    #print([m for m in dir(q_scale_dsl.iterator) if not m.startswith('__')])
+    # FP8 per-tensor scales: pass GPU data pointers as Int64 to avoid sync point.
+    q_scale_ptr = Int64(q_scale.data_ptr()) if q_scale is not None else None
+    k_scale_ptr = Int64(k_scale.data_ptr()) if k_scale is not None else None
+    v_scale_ptr = Int64(v_scale.data_ptr()) if v_scale is not None else None
+    o_scale_ptr = Int64(o_scale.data_ptr()) if o_scale is not None else None
 
     if compile_key not in _flash_attn_fwd.compile_cache:
         (
@@ -550,10 +550,10 @@ def _flash_attn_fwd(
             learnable_sink_tensor,
             sparse_tensors,
             cute_aux_tensors,
-            #q_scale_dsl,
-            #k_scale_dsl,
-            #v_scale_dsl,
-            #o_scale_dsl,
+            q_scale_ptr,
+            k_scale_ptr,
+            v_scale_ptr,
+            o_scale_ptr,
             options="--enable-tvm-ffi",
         )
 
@@ -580,10 +580,10 @@ def _flash_attn_fwd(
             learnable_sink,
             normalized_block_sparse_tensors[:4] if normalized_block_sparse_tensors is not None else None,
             aux_tensors,
-            # q_scale_dsl,
-            #k_scale.detach(),
-            #v_scale.detach(),
-            #o_scale.detach(),
+            q_scale.data_ptr() if q_scale is not None else None,
+            k_scale.data_ptr() if k_scale is not None else None,
+            v_scale.data_ptr() if v_scale is not None else None,
+            o_scale.data_ptr() if o_scale is not None else None,
         )
     if is_split_kv:
         _flash_attn_fwd_combine(
